@@ -48,7 +48,8 @@ public:
          */
         Builder& texture(size_t index, const std::string& name,
                 filament::backend::SamplerType type,
-                filament::backend::SamplerFormat format) noexcept;
+                filament::backend::SamplerFormat format,
+                bool multisample) noexcept;
 
         /**
          * Add a sampler argument to the argument buffer structure.
@@ -56,6 +57,14 @@ public:
          * @param name the name of the texture argument
          */
         Builder& sampler(size_t index, const std::string& name) noexcept;
+
+        /**
+         * Add a buffer argument to the argument buffer structure.
+         * @param index the [[id(n)]] index of the buffer argument
+         * @param type the type of data the buffer points to
+         * @param name the name of the buffer argument
+         */
+        Builder& buffer(size_t index, const std::string& type, const std::string& name) noexcept;
 
         MetalArgumentBuffer* build();
 
@@ -69,6 +78,7 @@ public:
             size_t index;
             filament::backend::SamplerType type;
             filament::backend::SamplerFormat format;
+            bool multisample;
 
             std::ostream& write(std::ostream& os) const;
         };
@@ -80,7 +90,15 @@ public:
             std::ostream& write(std::ostream& os) const;
         };
 
-        using ArgumentType = std::variant<TextureArgument, SamplerArgument>;
+        struct BufferArgument {
+            std::string name;
+            size_t index;
+            std::string type;
+
+            std::ostream& write(std::ostream& os) const;
+        };
+
+        using ArgumentType = std::variant<TextureArgument, SamplerArgument, BufferArgument>;
         std::vector<ArgumentType> mArguments;
     };
 

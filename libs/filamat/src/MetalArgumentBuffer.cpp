@@ -18,6 +18,7 @@
 
 #include <sstream>
 #include <utility>
+#include <variant>
 
 namespace filamat {
 
@@ -29,17 +30,32 @@ MetalArgumentBuffer::Builder& filamat::MetalArgumentBuffer::Builder::name(
 
 MetalArgumentBuffer::Builder& MetalArgumentBuffer::Builder::texture(size_t index,
         const std::string& name, filament::backend::SamplerType type,
-        filament::backend::SamplerFormat format) noexcept {
+        filament::backend::SamplerFormat format,
+        bool multisample) noexcept {
+
+    using namespace filament::backend;
+
     // All combinations of SamplerType and SamplerFormat are valid except for SAMPLER_3D / SHADOW.
-    assert_invariant(type != filament::backend::SamplerType::SAMPLER_3D ||
-            format != filament::backend::SamplerFormat::SHADOW);
-    mArguments.emplace_back(TextureArgument { name, index, type, format });
+    assert_invariant(type != SamplerType::SAMPLER_3D || format != SamplerFormat::SHADOW);
+
+    // multisample textures have restrictions too
+    assert_invariant(!multisample || (
+            format != SamplerFormat::SHADOW && (
+                    type == SamplerType::SAMPLER_2D || type == SamplerType::SAMPLER_2D_ARRAY)));
+
+    mArguments.emplace_back(TextureArgument { name, index, type, format, multisample });
     return *this;
 }
 
 MetalArgumentBuffer::Builder& MetalArgumentBuffer::Builder::sampler(
         size_t index, const std::string& name) noexcept {
     mArguments.emplace_back(SamplerArgument { name , index });
+    return *this;
+}
+
+MetalArgumentBuffer::Builder& MetalArgumentBuffer::Builder::buffer(
+        size_t index, const std::string& type, const std::string& name) noexcept {
+    mArguments.emplace_back(BufferArgument { name, index, type });
     return *this;
 }
 
@@ -79,6 +95,10 @@ std::ostream& MetalArgumentBuffer::Builder::TextureArgument::write(std::ostream&
             break;
     }
 
+    if (multisample) {
+        os << "_ms";
+    }
+
     switch (format) {
         case filament::backend::SamplerFormat::INT:
             os << "<int>";
@@ -101,11 +121,13 @@ std::ostream& MetalArgumentBuffer::Builder::SamplerArgument::write(std::ostream&
     return os;
 }
 
+std::ostream& MetalArgumentBuffer::Builder::BufferArgument::write(std::ostream& os) const {
+    os << "constant " << type << "* " << name << " [[id(" << index << ")]];" << std::endl;
+    return os;
+}
+
 MetalArgumentBuffer::MetalArgumentBuffer(Builder& builder) {
     mName = builder.mName;
-
-    std::stringstream ss;
-    ss << "struct " << mName << " {" << std::endl;
 
     auto& args = builder.mArguments;
 
@@ -120,6 +142,18 @@ MetalArgumentBuffer::MetalArgumentBuffer(Builder& builder) {
                 return std::visit(
                         [](auto const& x, auto const& y) { return x.index == y.index; }, lhs, rhs);
             }) == args.end());
+
+    std::stringstream ss;
+
+    // Add forward declarations of buffers.
+    for (const auto& a : builder.mArguments) {
+        if (std::holds_alternative<Builder::BufferArgument>(a)) {
+            const auto& bufferArg = std::get<Builder::BufferArgument>(a);
+            ss << "struct " << bufferArg.type << ";" << std::endl;
+        }
+    }
+
+    ss << "struct " << mName << " {" << std::endl;
 
     for (const auto& a : builder.mArguments) {
         std::visit([&](auto&& arg) {

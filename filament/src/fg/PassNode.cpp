@@ -190,10 +190,10 @@ void RenderPassNode::resolve() noexcept {
                 minHeight = std::min(minHeight, h);
                 maxHeight = std::max(maxHeight, h);
             }
-            // additionally, clear implies discardStart
-            rt.backend.params.flags.discardStart |= (
-                    rt.descriptor.clearFlags & rt.targetBufferFlags);
         }
+        // additionally, clear implies discardStart
+        rt.backend.params.flags.discardStart |= (
+                rt.descriptor.clearFlags & rt.targetBufferFlags);
 
         assert_invariant(minWidth == maxWidth);
         assert_invariant(minHeight == maxHeight);
@@ -228,6 +228,11 @@ void RenderPassNode::resolve() noexcept {
             rt.descriptor.clearFlags = pImportedRenderTarget->importedDesc.clearFlags;
             rt.descriptor.samples    = pImportedRenderTarget->importedDesc.samples;
             rt.backend.target        = pImportedRenderTarget->target;
+
+            // We could end-up here more than once, for instance if the rendertarget is used
+            // by multiple passes (this would imply a read-back, btw). In this case, we don't want
+            // to clear it the 2nd time, so we clear the imported pass's clear flags.
+            pImportedRenderTarget->importedDesc.clearFlags = TargetBufferFlags::NONE;
 
             // but don't discard attachments the imported target tells us to keep
             rt.backend.params.flags.discardStart &= ~pImportedRenderTarget->importedDesc.keepOverrideStart;
@@ -271,8 +276,8 @@ void RenderPassNode::RenderPassData::devirtualize(FrameGraph& fg,
                 name, targetBufferFlags,
                 backend.params.viewport.width,
                 backend.params.viewport.height,
-                descriptor.samples,
-                colorInfo,info[0], info[1]);
+                descriptor.samples, descriptor.layerCount,
+                colorInfo, info[0], info[1]);
     }
 }
 

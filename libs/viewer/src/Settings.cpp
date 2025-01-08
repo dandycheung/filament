@@ -88,6 +88,7 @@ static int parse(jsmntok_t const* tokens, int i, const char* jsonChunk, ToneMapp
     else if (0 == compare(tokens[i], jsonChunk, "FILMIC")) { *out = ToneMapping::FILMIC; }
     else if (0 == compare(tokens[i], jsonChunk, "AGX")) { *out = ToneMapping::AGX; }
     else if (0 == compare(tokens[i], jsonChunk, "GENERIC")) { *out = ToneMapping::GENERIC; }
+    else if (0 == compare(tokens[i], jsonChunk, "PBR_NEUTRAL")) { *out = ToneMapping::PBR_NEUTRAL; }
     else if (0 == compare(tokens[i], jsonChunk, "DISPLAY_RANGE")) { *out = ToneMapping::DISPLAY_RANGE; }
     else {
         slog.w << "Invalid ToneMapping: '" << STR(tokens[i], jsonChunk) << "'" << io::endl;
@@ -504,6 +505,8 @@ static int parse(jsmntok_t const* tokens, int i, const char* jsonChunk, ViewerOp
              i = parse(tokens, i + 1, jsonChunk, &out->cameraFar);
         } else if (compare(tok, jsonChunk, "cameraEyeOcularDistance") == 0) {
             i = parse(tokens, i + 1, jsonChunk, &out->cameraEyeOcularDistance);
+        } else if (compare(tok, jsonChunk, "cameraEyeToeIn") == 0) {
+            i = parse(tokens, i + 1, jsonChunk, &out->cameraEyeToeIn);
         } else if (compare(tok, jsonChunk, "groundShadowStrength") == 0) {
              i = parse(tokens, i + 1, jsonChunk, &out->groundShadowStrength);
         } else if (compare(tok, jsonChunk, "groundPlaneEnabled") == 0) {
@@ -658,9 +661,11 @@ void applySettings(Engine* engine, const ViewerOptions& settings, Camera* camera
     // "cross-eyed" stereo.
     // For cross-eyed stereo, Eye 0 is really the RIGHT eye, while Eye 1 is the LEFT eye.
     const auto od = settings.cameraEyeOcularDistance;
+    const auto toeIn = settings.cameraEyeToeIn;
     const auto eyeCount = engine->getConfig().stereoscopicEyeCount;
-    const mat4 rightEye = mat4::translation(double3{ od, 0.0, 0.0});    // right eye
-    const mat4 leftEye  = mat4::translation(double3{-od, 0.0, 0.0});    // left eye
+    const double3 up = double3(0.0, 1.0, 0.0);
+    const mat4 rightEye = mat4::translation(double3{ od, 0.0, 0.0}) * mat4::rotation( toeIn, up);
+    const mat4 leftEye  = mat4::translation(double3{-od, 0.0, 0.0}) * mat4::rotation(-toeIn, up);
     const mat4 modelMatrices[2] = { rightEye, leftEye };
     for (int i = 0; i < eyeCount; i++) {
         camera->setEyeModelMatrix(i, modelMatrices[i % 2]);
@@ -675,11 +680,12 @@ constexpr ToneMapper* createToneMapper(const ColorGradingSettings& settings) noe
         case ToneMapping::FILMIC: return new FilmicToneMapper;
         case ToneMapping::AGX: return new AgxToneMapper(settings.agxToneMapper.look);
         case ToneMapping::GENERIC: return new GenericToneMapper(
-                    settings.genericToneMapper.contrast,
-                    settings.genericToneMapper.midGrayIn,
-                    settings.genericToneMapper.midGrayOut,
-                    settings.genericToneMapper.hdrMax
+                settings.genericToneMapper.contrast,
+                settings.genericToneMapper.midGrayIn,
+                settings.genericToneMapper.midGrayOut,
+                settings.genericToneMapper.hdrMax
         );
+        case ToneMapping::PBR_NEUTRAL: return new PBRNeutralToneMapper;
         case ToneMapping::DISPLAY_RANGE: return new DisplayRangeToneMapper;
     }
 }
@@ -730,6 +736,7 @@ static std::ostream& operator<<(std::ostream& out, ToneMapping in) {
         case ToneMapping::FILMIC: return out << "\"FILMIC\"";
         case ToneMapping::AGX: return out << "\"AGX\"";
         case ToneMapping::GENERIC: return out << "\"GENERIC\"";
+        case ToneMapping::PBR_NEUTRAL: return out << "\"PBR_NEUTRAL\"";
         case ToneMapping::DISPLAY_RANGE: return out << "\"DISPLAY_RANGE\"";
     }
     return out << "\"INVALID\"";
@@ -877,6 +884,7 @@ static std::ostream& operator<<(std::ostream& out, const ViewerOptions& in) {
         << "\"cameraNear\": " << (in.cameraNear) << ",\n"
         << "\"cameraFar\": " << (in.cameraFar) << ",\n"
         << "\"cameraEyeOcularDistance\": " << (in.cameraEyeOcularDistance) << ",\n"
+        << "\"cameraEyeToeIn\": " << (in.cameraEyeToeIn) << ",\n"
         << "\"groundShadowStrength\": " << (in.groundShadowStrength) << ",\n"
         << "\"groundPlaneEnabled\": " << to_string(in.groundPlaneEnabled) << ",\n"
         << "\"skyboxEnabled\": " << to_string(in.skyboxEnabled) << ",\n"
