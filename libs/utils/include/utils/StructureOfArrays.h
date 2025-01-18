@@ -17,8 +17,10 @@
 #ifndef TNT_UTILS_STRUCTUREOFARRAYS_H
 #define TNT_UTILS_STRUCTUREOFARRAYS_H
 
+#include <type_traits>
 #include <utils/Allocator.h>
 #include <utils/compiler.h>
+#include <utils/debug.h>
 #include <utils/Slice.h>
 
 #include <stddef.h>
@@ -366,7 +368,7 @@ public:
         size_t last = mSize++;
         // Fold expression on the comma operator
         ([&]{
-            new(std::get<Indices>(mArrays) + last) Elements{std::get<Indices>(args)};
+            new(std::get<Indices>(mArrays) + last) Elements{std::get<Indices>(std::forward<Structure>(args))};
         }() , ...);
     }
 
@@ -511,7 +513,7 @@ public:
             return (soa.elementAt<E>(i) = other);
         }
         UTILS_ALWAYS_INLINE Type const& operator = (Type&& other) noexcept {
-            return (soa.elementAt<E>(i) = other);
+            return (soa.elementAt<E>(i) = std::forward<Type>(other));
         }
         // comparisons
         UTILS_ALWAYS_INLINE bool operator==(Type const& other) const {
@@ -555,7 +557,7 @@ private:
     }
 
     inline void resizeNoCheck(size_t needed) noexcept {
-        assert(mCapacity >= needed);
+        assert_invariant(mCapacity >= needed);
         if (needed < mSize) {
             // we shrink the arrays
             destroy_each(needed, mSize);
@@ -669,7 +671,7 @@ template<typename Allocator, typename... Elements>
 inline
 typename StructureOfArraysBase<Allocator, Elements...>::IteratorValueRef&
 StructureOfArraysBase<Allocator, Elements...>::IteratorValueRef::operator=(
-        StructureOfArraysBase::IteratorValueRef const& rhs) {
+        IteratorValueRef const& rhs) {
     return operator=(IteratorValue(rhs));
 }
 
@@ -677,7 +679,7 @@ template<typename Allocator, typename... Elements>
 inline
 typename StructureOfArraysBase<Allocator, Elements...>::IteratorValueRef&
 StructureOfArraysBase<Allocator, Elements...>::IteratorValueRef::operator=(
-        StructureOfArraysBase::IteratorValueRef&& rhs) noexcept {
+        IteratorValueRef&& rhs) noexcept {
     return operator=(IteratorValue(rhs));
 }
 
@@ -686,7 +688,7 @@ template<size_t... Is>
 inline
 typename StructureOfArraysBase<Allocator, Elements...>::IteratorValueRef&
 StructureOfArraysBase<Allocator, Elements...>::IteratorValueRef::assign(
-        StructureOfArraysBase::IteratorValue const& rhs, std::index_sequence<Is...>) {
+        IteratorValue const& rhs, std::index_sequence<Is...>) {
     // implements IteratorValueRef& IteratorValueRef::operator=(IteratorValue const& rhs)
     auto UTILS_UNUSED l = { (soa->elementAt<Is>(index) = std::get<Is>(rhs.elements), 0)... };
     return *this;
@@ -697,7 +699,7 @@ template<size_t... Is>
 inline
 typename StructureOfArraysBase<Allocator, Elements...>::IteratorValueRef&
 StructureOfArraysBase<Allocator, Elements...>::IteratorValueRef::assign(
-        StructureOfArraysBase::IteratorValue&& rhs, std::index_sequence<Is...>) noexcept {
+        IteratorValue&& rhs, std::index_sequence<Is...>) noexcept {
     // implements IteratorValueRef& IteratorValueRef::operator=(IteratorValue&& rhs) noexcept
     auto UTILS_UNUSED l = {
             (soa->elementAt<Is>(index) = std::move(std::get<Is>(rhs.elements)), 0)... };

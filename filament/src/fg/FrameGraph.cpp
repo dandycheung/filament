@@ -16,16 +16,31 @@
 
 #include "fg/FrameGraph.h"
 #include "fg/details/PassNode.h"
+#include "fg/details/Resource.h"
 #include "fg/details/ResourceNode.h"
 #include "fg/details/DependencyGraph.h"
+
+#include "FrameGraphId.h"
+#include "FrameGraphPass.h"
+#include "FrameGraphRenderPass.h"
+#include "FrameGraphTexture.h"
+#include "ResourceAllocator.h"
 
 #include "details/Engine.h"
 
 #include <backend/DriverEnums.h>
 #include <backend/Handle.h>
 
+#include <utils/compiler.h>
+#include <utils/debug.h>
+#include <utils/ostream.h>
 #include <utils/Panic.h>
 #include <utils/Systrace.h>
+
+#include <algorithm>
+#include <functional>
+
+#include <stdint.h>
 
 namespace filament {
 
@@ -37,7 +52,7 @@ void FrameGraph::Builder::sideEffect() noexcept {
     mPassNode->makeTarget();
 }
 
-const char* FrameGraph::Builder::getName(FrameGraphHandle handle) const noexcept {
+const char* FrameGraph::Builder::getName(FrameGraphHandle const handle) const noexcept {
     return mFrameGraph.getResource(handle)->name;
 }
 
@@ -59,9 +74,10 @@ FrameGraphId<FrameGraphTexture> FrameGraph::Builder::declareRenderPass(
 
 // ------------------------------------------------------------------------------------------------
 
-FrameGraph::FrameGraph(ResourceAllocatorInterface& resourceAllocator)
+FrameGraph::FrameGraph(ResourceAllocatorInterface& resourceAllocator, Mode const mode)
         : mResourceAllocator(resourceAllocator),
           mArena("FrameGraph Arena", 262144),
+          mMode(mode),
           mResourceSlots(mArena),
           mResources(mArena),
           mResourceNodes(mArena),
@@ -179,11 +195,11 @@ FrameGraph& FrameGraph::compile() noexcept {
 
 void FrameGraph::execute(backend::DriverApi& driver) noexcept {
 
-    SYSTRACE_CALL();
-
+    bool const useProtectedMemory = mMode == Mode::PROTECTED;
     auto const& passNodes = mPassNodes;
     auto& resourceAllocator = mResourceAllocator;
 
+    SYSTRACE_NAME("FrameGraph");
     driver.pushGroupMarker("FrameGraph");
 
     auto first = passNodes.begin();
@@ -194,17 +210,16 @@ void FrameGraph::execute(backend::DriverApi& driver) noexcept {
         assert_invariant(!node->isCulled());
 
         SYSTRACE_NAME(node->getName());
-
         driver.pushGroupMarker(node->getName());
 
         // devirtualize resourcesList
         for (VirtualResource* resource : node->devirtualize) {
             assert_invariant(resource->first == node);
-            resource->devirtualize(resourceAllocator);
+            resource->devirtualize(resourceAllocator, useProtectedMemory);
         }
 
         // call execute
-        FrameGraphResources resources(*this, *node);
+        FrameGraphResources const resources(*this, *node);
         node->execute(resources, driver);
 
         // destroy concrete resources
@@ -212,13 +227,12 @@ void FrameGraph::execute(backend::DriverApi& driver) noexcept {
             assert_invariant(resource->last == node);
             resource->destroy(resourceAllocator);
         }
-
         driver.popGroupMarker();
     }
     driver.popGroupMarker();
 }
 
-void FrameGraph::addPresentPass(const std::function<void(FrameGraph::Builder&)>& setup) noexcept {
+void FrameGraph::addPresentPass(const std::function<void(Builder&)>& setup) noexcept {
     PresentPassNode* node = mArena.make<PresentPassNode>(*this);
     mPassNodes.push_back(node);
     Builder builder(*this, node);
@@ -276,7 +290,7 @@ FrameGraphHandle FrameGraph::addSubResourceInternal(FrameGraphHandle parent,
     return handle;
 }
 
-FrameGraphHandle FrameGraph::readInternal(FrameGraphHandle handle, PassNode* passNode,
+FrameGraphHandle FrameGraph::readInternal(FrameGraphHandle const handle, PassNode* passNode,
         const std::function<bool(ResourceNode*, VirtualResource*)>& connect) {
 
     assertValid(handle);
@@ -286,9 +300,9 @@ FrameGraphHandle FrameGraph::readInternal(FrameGraphHandle handle, PassNode* pas
 
     // Check preconditions
     bool const passAlreadyAWriter = node->hasWriteFrom(passNode);
-    ASSERT_PRECONDITION(!passAlreadyAWriter,
-            "Pass \"%s\" already writes to \"%s\"",
-            passNode->getName(), node->getName());
+    FILAMENT_CHECK_PRECONDITION(!passAlreadyAWriter)
+            << "Pass \"" << passNode->getName() << "\" already writes to \"" << node->getName()
+            << "\"";
 
     if (!node->hasWriterPass() && !resource->isImported()) {
         // TODO: we're attempting to read from a resource that was never written and is not
@@ -383,8 +397,8 @@ FrameGraphHandle FrameGraph::writeInternal(FrameGraphHandle handle, PassNode* pa
     return {};
 }
 
-FrameGraphHandle FrameGraph::forwardResourceInternal(FrameGraphHandle resourceHandle,
-        FrameGraphHandle replaceResourceHandle) {
+FrameGraphHandle FrameGraph::forwardResourceInternal(FrameGraphHandle const resourceHandle,
+        FrameGraphHandle const replaceResourceHandle) {
 
     assertValid(resourceHandle);
 
@@ -435,7 +449,7 @@ FrameGraphId<FrameGraphTexture> FrameGraph::import(char const* name,
     return FrameGraphId<FrameGraphTexture>(addResourceInternal(vresource));
 }
 
-bool FrameGraph::isValid(FrameGraphHandle handle) const {
+bool FrameGraph::isValid(FrameGraphHandle const handle) const {
     // Code below is written this way so that we can set breakpoints easily.
     if (!handle.isInitialized()) {
         return false;
@@ -447,10 +461,10 @@ bool FrameGraph::isValid(FrameGraphHandle handle) const {
     return true;
 }
 
-void FrameGraph::assertValid(FrameGraphHandle handle) const {
-    ASSERT_PRECONDITION(isValid(handle),
-            "Resource handle is invalid or uninitialized {id=%u, version=%u}",
-            (int)handle.index, (int)handle.version);
+void FrameGraph::assertValid(FrameGraphHandle const handle) const {
+    FILAMENT_CHECK_PRECONDITION(isValid(handle))
+            << "Resource handle is invalid or uninitialized {id=" << (int)handle.index
+            << ", version=" << (int)handle.version << "}";
 }
 
 bool FrameGraph::isCulled(FrameGraphPassBase const& pass) const noexcept {

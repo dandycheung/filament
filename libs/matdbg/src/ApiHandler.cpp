@@ -43,19 +43,6 @@ namespace {
 auto const& kSuccessHeader = DebugServer::kSuccessHeader;
 auto const& kErrorHeader = DebugServer::kErrorHeader;
 
-void spirvToAsm(struct mg_connection* conn, uint32_t const* spirv, size_t size) {
-    auto spirvDisassembly = ShaderExtractor::spirvToText(spirv, size / 4);
-    mg_printf(conn, kSuccessHeader.data(), "application/txt");
-    mg_write(conn, spirvDisassembly.c_str(), spirvDisassembly.size());
-}
-
-void spirvToGlsl(ShaderModel shaderModel, struct mg_connection* conn, uint32_t const* spirv,
-        size_t size) {
-    auto glsl = ShaderExtractor::spirvToGLSL(shaderModel, spirv, size / 4);
-    mg_printf(conn, kSuccessHeader.data(), "application/txt");
-    mg_printf(conn, glsl.c_str(), glsl.size());
-}
-
 } // anonymous
 
 using filaflat::ChunkContainer;
@@ -63,7 +50,7 @@ using filamat::ChunkType;
 using utils::FixedCapacityVector;
 
 static auto const error = [](int line, std::string const& uri) {
-    utils::slog.e << "DebugServer: 404 at line " << line << ": " << uri << utils::io::endl;
+    utils::slog.e << "[matdbg] DebugServer: 404 at line " << line << ": " << uri << utils::io::endl;
     return false;
 };
 
@@ -80,7 +67,7 @@ MaterialRecord const* ApiHandler::getMaterialRecord(struct mg_request_info const
 bool ApiHandler::handleGetApiShader(struct mg_connection* conn,
         struct mg_request_info const* request) {
     auto const softError = [conn, request](char const* msg) {
-        utils::slog.e << "DebugServer: " << msg << ": " << request->query_string << utils::io::endl;
+        utils::slog.e << "[matdbg] DebugServer: " << msg << ": " << request->query_string << utils::io::endl;
         mg_printf(conn, kErrorHeader.data(), "application/txt");
         mg_write(conn, msg, strlen(msg));
         return true;
@@ -145,8 +132,10 @@ bool ApiHandler::handleGetApiShader(struct mg_connection* conn,
         filaflat::ShaderContent content;
         extractor.getShader(item.shaderModel, item.variant, item.pipelineStage, content);
 
+        std::string const shader = mFormatter.format((char const*) content.data());
         mg_printf(conn, kSuccessHeader.data(), "application/txt");
-        mg_write(conn, content.data(), content.size() - 1);
+        mg_write(conn, shader.c_str(), shader.size());
+
         return true;
     }
 
@@ -171,12 +160,19 @@ bool ApiHandler::handleGetApiShader(struct mg_connection* conn,
         extractor.getShader(item.shaderModel, item.variant, item.pipelineStage, content);
 
         if (language == spirv) {
-            spirvToAsm(conn, (uint32_t const*) content.data(), content.size());
+            auto spirvDisassembly = ShaderExtractor::spirvToText((uint32_t const*) content.data(),
+                    content.size() / 4);
+            mg_printf(conn, kSuccessHeader.data(), "application/txt");
+            mg_write(conn, spirvDisassembly.c_str(), spirvDisassembly.size());
             return true;
         }
 
         if (language == glsl) {
-            spirvToGlsl(item.shaderModel, conn, (uint32_t const*) content.data(), content.size());
+            auto glsl = ShaderExtractor::spirvToGLSL(item.shaderModel,
+                    (uint32_t const*) content.data(), content.size() / 4);
+            std::string const shader = mFormatter.format((char const*) glsl.c_str());
+            mg_printf(conn, kSuccessHeader.data(), "application/txt");
+            mg_printf(conn, shader.c_str(), shader.size());
             return true;
         }
 
@@ -204,8 +200,9 @@ bool ApiHandler::handleGetApiShader(struct mg_connection* conn,
         extractor.getShader(item.shaderModel, item.variant, item.pipelineStage, content);
 
         if (language == msl) {
+            std::string const shader = mFormatter.format((char const*) content.data());
             mg_printf(conn, kSuccessHeader.data(), "application/txt");
-            mg_write(conn, content.data(), content.size() - 1);
+            mg_write(conn, shader.c_str(), shader.size());
             return true;
         }
 
@@ -215,7 +212,7 @@ bool ApiHandler::handleGetApiShader(struct mg_connection* conn,
 }
 
 void ApiHandler::addMaterial(MaterialRecord const* material) {
-    std::unique_lock<utils::Mutex> lock(mStatusMutex);
+    std::unique_lock const lock(mStatusMutex);
     snprintf(statusMaterialId, sizeof(statusMaterialId), "%8.8x", material->key);
     mStatusCondition.notify_all();
 }
@@ -229,7 +226,7 @@ bool ApiHandler::handleGetStatus(struct mg_connection* conn,
         return true;
     }
 
-    std::unique_lock<utils::Mutex> lock(mStatusMutex);
+    std::unique_lock<std::mutex> lock(mStatusMutex);
     uint64_t const currentStatusCount = mCurrentStatus;
     if (mStatusCondition.wait_for(lock, 10s,
                 [this, currentStatusCount] { return currentStatusCount < mCurrentStatus; })) {
@@ -258,15 +255,15 @@ bool ApiHandler::handlePost(CivetServer* server, struct mg_connection* conn) {
     //   [material id] [api index] [shader index] [shader source....]
     if (uri == "/api/edit") {
         struct mg_request_info const* req_info = mg_get_request_info(conn);
-        size_t msgLen = req_info->content_length;
+        size_t const msgLen = req_info->content_length;
 
         char buf[1024];
         size_t readLen = 0;
         std::stringstream sstream;
         while (readLen < msgLen) {
-            int res = mg_read(conn, buf, sizeof(buf));
+            int const res = mg_read(conn, buf, sizeof(buf));
             if (res < 0) {
-                utils::slog.e << "civet error parsing /api/edit body: " << res << utils::io::endl;
+                utils::slog.e << "[matdbg] civet error parsing /api/edit body: " << res << utils::io::endl;
                 break;
             }
             if (res == 0) {
@@ -279,7 +276,7 @@ bool ApiHandler::handlePost(CivetServer* server, struct mg_connection* conn) {
         int api;
         int shaderIndex;
         sstream >> std::hex >> matid >> std::dec >> api >> shaderIndex;
-        std::string shader = sstream.str().substr(sstream.tellg());
+        std::string const shader = sstream.str().substr(sstream.tellg());
 
         mServer->handleEditCommand(matid, backend::Backend(api), shaderIndex, shader.c_str(),
                 shader.size());
@@ -298,7 +295,7 @@ bool ApiHandler::handleGet(CivetServer* server, struct mg_connection* conn) {
         mServer->updateActiveVariants();
 
         // Careful not to lock the above line.
-        std::unique_lock<utils::Mutex> lock(mServer->mMaterialRecordsMutex);
+        std::unique_lock const lock(mServer->mMaterialRecordsMutex);
         mg_printf(conn, kSuccessHeader.data(), "application/json");
         mg_printf(conn, "{");
 
@@ -329,7 +326,7 @@ bool ApiHandler::handleGet(CivetServer* server, struct mg_connection* conn) {
     }
 
     if (uri == "/api/matids") {
-        std::unique_lock<utils::Mutex> lock(mServer->mMaterialRecordsMutex);
+        std::unique_lock const lock(mServer->mMaterialRecordsMutex);
         mg_printf(conn, kSuccessHeader.data(), "application/json");
         mg_printf(conn, "[");
         int index = 0;
@@ -342,7 +339,7 @@ bool ApiHandler::handleGet(CivetServer* server, struct mg_connection* conn) {
     }
 
     if (uri == "/api/materials") {
-        std::unique_lock<utils::Mutex> lock(mServer->mMaterialRecordsMutex);
+        std::unique_lock const lock(mServer->mMaterialRecordsMutex);
         mg_printf(conn, kSuccessHeader.data(), "application/json");
         mg_printf(conn, "[");
         int index = 0;

@@ -59,7 +59,7 @@ public:
             math::mat4 const& projectionForCulling, double near, double far) noexcept;
 
     inline void setCustomProjection(math::mat4 const& projection,
-            double near, double far) noexcept {
+            double const near, double const far) noexcept {
         setCustomProjection(projection, projection, near, far);
     }
 
@@ -67,11 +67,11 @@ public:
             math::mat4 const& projectionForCulling, double near, double far);
 
 
-    void setScaling(math::double2 scaling) noexcept { mScalingCS = scaling; }
+    void setScaling(math::double2 const scaling) noexcept { mScalingCS = scaling; }
 
     math::double4 getScaling() const noexcept { return math::double4{ mScalingCS, 1.0, 1.0 }; }
 
-    void setShift(math::double2 shift) noexcept { mShiftCS = shift * 2.0; }
+    void setShift(math::double2 const shift) noexcept { mShiftCS = shift * 2.0; }
 
     math::double2 getShift() const noexcept { return mShiftCS * 0.5; }
 
@@ -82,7 +82,7 @@ public:
     // culling the projection matrix to be used for culling, contains scaling/shift
     math::mat4 getCullingProjectionMatrix() const noexcept;
 
-    math::mat4 getEyeFromViewMatrix(uint8_t eye) const noexcept { return mEyeFromView[eye]; }
+    math::mat4 getEyeFromViewMatrix(uint8_t const eye) const noexcept { return mEyeFromView[eye]; }
 
     // viewing projection matrix set by the user
     const math::mat4& getUserProjectionMatrix(uint8_t eyeId) const;
@@ -135,7 +135,7 @@ public:
         return normalize(-getModelMatrix()[2].xyz);
     }
 
-    float getFieldOfView(Camera::Fov direction) const noexcept {
+    float getFieldOfView(Fov const direction) const noexcept {
         // note: this is meaningless for an orthographic projection
         auto const& p = getProjectionMatrix();
         switch (direction) {
@@ -146,7 +146,7 @@ public:
         }
     }
 
-    float getFieldOfViewInDegrees(Camera::Fov direction) const noexcept {
+    float getFieldOfViewInDegrees(Fov const direction) const noexcept {
         return getFieldOfView(direction) * math::f::RAD_TO_DEG;
     }
 
@@ -171,7 +171,7 @@ public:
         return mSensitivity;
     }
 
-    void setFocusDistance(float distance) noexcept {
+    void setFocusDistance(float const distance) noexcept {
         mFocusDistance = distance;
     }
 
@@ -220,8 +220,18 @@ private:
 
 struct CameraInfo {
     CameraInfo() noexcept {}
-    explicit CameraInfo(FCamera const& camera) noexcept;
+
+    // Creates a CameraInfo relative to inWorldTransform (i.e. it's model matrix is
+    // transformed by inWorldTransform and inWorldTransform is recorded).
+    // This is typically used for the color pass camera.
     CameraInfo(FCamera const& camera, math::mat4 const& inWorldTransform) noexcept;
+
+    // Creates a CameraInfo from a camera that is relative to mainCameraInfo.
+    // This is typically used for the shadow pass cameras.
+    CameraInfo(FCamera const& camera, CameraInfo const& mainCameraInfo) noexcept;
+
+    // Creates a CameraInfo from the FCamera
+    explicit CameraInfo(FCamera const& camera) noexcept;
 
     union {
         // projection matrix for drawing (infinite zfar)
@@ -249,6 +259,11 @@ struct CameraInfo {
     math::float3 const& getPosition() const noexcept { return model[3].xyz; }
     math::float3 getForwardVector() const noexcept { return normalize(-model[2].xyz); }
     math::mat4 getUserViewMatrix() const noexcept { return view * worldTransform; }
+
+private:
+    CameraInfo(FCamera const& camera,
+            math::mat4 const& inWorldTransform,
+            math::mat4 const& modelMatrix) noexcept;
 };
 
 FILAMENT_DOWNCAST(Camera)

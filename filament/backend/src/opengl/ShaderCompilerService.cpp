@@ -22,19 +22,31 @@
 
 #include <private/backend/BackendUtils.h>
 
-#include <backend/platforms/OpenGLPlatform.h>
 #include <backend/Program.h>
 
 #include <utils/compiler.h>
 #include <utils/CString.h>
+#include <utils/debug.h>
+#include <utils/FixedCapacityVector.h>
 #include <utils/JobSystem.h>
 #include <utils/Log.h>
+#include <utils/ostream.h>
+#include <utils/Panic.h>
 #include <utils/Systrace.h>
 
+#include <array>
+#include <cctype>
 #include <chrono>
+#include <mutex>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <variant>
+
+#include <stddef.h>
+#include <stdint.h>
 
 namespace filament::backend {
 
@@ -141,20 +153,43 @@ void* ShaderCompilerService::getUserData(const program_token_t& token) noexcept 
 ShaderCompilerService::ShaderCompilerService(OpenGLDriver& driver)
         : mDriver(driver),
           mBlobCache(driver.getContext()),
-          mCallbackManager(driver),
-          KHR_parallel_shader_compile(driver.getContext().ext.KHR_parallel_shader_compile) {
+          mCallbackManager(driver) {
 }
 
 ShaderCompilerService::~ShaderCompilerService() noexcept = default;
 
 bool ShaderCompilerService::isParallelShaderCompileSupported() const noexcept {
-    return KHR_parallel_shader_compile || mShaderCompilerThreadCount;
+    assert_invariant(mMode != Mode::UNDEFINED);
+    return mMode != Mode::SYNCHRONOUS;
 }
 
 void ShaderCompilerService::init() noexcept {
-    // If we have KHR_parallel_shader_compile, we always use it, it should be more resource
-    // friendly.
-    if (!KHR_parallel_shader_compile) {
+    if (UTILS_UNLIKELY(mDriver.getDriverConfig().disableParallelShaderCompile)) {
+        // user disabled parallel shader compile
+        mMode = Mode::SYNCHRONOUS;
+        return;
+    }
+
+    // Here we decide which mode we'll be using. We always prefer our own thread-pool if
+    // that mode is available because, we have no control on how the compilation queues are
+    // handled if done by the driver (so at the very least we'd need to decode this per-driver).
+    // In theory, using Mode::ASYNCHRONOUS (a.k.a. KHR_parallel_shader_compile) could be more
+    // efficient, since it doesn't require shared contexts.
+    // In practice, we already know that with ANGLE, Mode::ASYNCHRONOUS can cause very long
+    // pauses at glDraw() time in the situation where glLinkProgram() has been emitted, but has
+    // other programs ahead of it in ANGLE's queue.
+    if (mDriver.mPlatform.isExtraContextSupported()) {
+        // our thread-pool if possible
+        mMode = Mode::THREAD_POOL;
+    } else if (mDriver.getContext().ext.KHR_parallel_shader_compile) {
+        // if not, async shader compilation and link if the driver supports it
+        mMode = Mode::ASYNCHRONOUS;
+    } else {
+        // fallback to synchronous shader compilation
+        mMode = Mode::SYNCHRONOUS;
+    }
+
+    if (mMode == Mode::THREAD_POOL) {
         // - on Adreno there is a single compiler object. We can't use a pool > 1
         //   also glProgramBinary blocks if other threads are compiling.
         // - on Mali shader compilation can be multi-threaded, but program linking happens on
@@ -164,37 +199,42 @@ void ShaderCompilerService::init() noexcept {
         // - on macOS (M1 MacBook Pro/Ventura) there is global lock around all GL APIs when using
         //   a shared context, so parallel shader compilation yields no benefit.
         // - on windows/linux we could use more threads, tbd.
-        if (mDriver.mPlatform.isExtraContextSupported()) {
-            // By default, we use one thread at the same priority as the gl thread. This is the
-            // safest choice that avoids priority inversions.
-            uint32_t poolSize = 1;
-            JobSystem::Priority priority = JobSystem::Priority::DISPLAY;
 
-            auto const& renderer = mDriver.getContext().state.renderer;
-            if (UTILS_UNLIKELY(strstr(renderer, "PowerVR"))) {
-                // The PowerVR driver support parallel shader compilation well, so we use 2
-                // threads, we can use lower priority threads here because urgent compilations
-                // will most likely happen on the main gl thread. Using too many thread can
-                // increase memory pressure significantly.
-                poolSize = 2;
-                priority = JobSystem::Priority::BACKGROUND;
-            }
+        // By default, we use one thread at the same priority as the gl thread. This is the
+        // safest choice that avoids priority inversions.
+        uint32_t poolSize = 1;
+        JobSystem::Priority priority = JobSystem::Priority::DISPLAY;
 
-            mShaderCompilerThreadCount = poolSize;
-            mCompilerThreadPool.init(mShaderCompilerThreadCount,
-                    [&platform = mDriver.mPlatform, priority]() {
-                        // give the thread a name
-                        JobSystem::setThreadName("CompilerThreadPool");
-                        // run at a slightly lower priority than other filament threads
-                        JobSystem::setThreadPriority(priority);
-                        // create a gl context current to this thread
-                        platform.createContext(true);
-                    },
-                    [&platform = mDriver.mPlatform]() {
-                        // release context and thread state
-                        platform.releaseContext();
-                    });
+        auto const& renderer = mDriver.getContext().state.renderer;
+        // Some drivers support parallel shader compilation well, so we use N
+        // threads, we can use lower priority threads here because urgent compilations
+        // will most likely happen on the main gl thread. Using too many thread can
+        // increase memory pressure significantly.
+        if (UTILS_UNLIKELY(strstr(renderer, "PowerVR"))) {
+            // For PowerVR, it's unclear what the cost of extra shared contexts is, so we only
+            // use 2 to be safe.
+            poolSize = 2;
+            priority = JobSystem::Priority::BACKGROUND;
+        } else if (UTILS_UNLIKELY(strstr(renderer, "ANGLE"))) {
+            // Angle shared contexts are not expensive once we have two.
+            poolSize = (std::thread::hardware_concurrency() + 1) / 2;
+            priority = JobSystem::Priority::BACKGROUND;
         }
+
+        mShaderCompilerThreadCount = poolSize;
+        mCompilerThreadPool.init(mShaderCompilerThreadCount,
+                [&platform = mDriver.mPlatform, priority]() {
+                    // give the thread a name
+                    JobSystem::setThreadName("CompilerThreadPool");
+                    // run at a slightly lower priority than other filament threads
+                    JobSystem::setThreadPriority(priority);
+                    // create a gl context current to this thread
+                    platform.createContext(true);
+                },
+                [&platform = mDriver.mPlatform]() {
+                    // release context and thread state
+                    platform.releaseContext();
+                });
     }
 }
 
@@ -228,18 +268,18 @@ ShaderCompilerService::program_token_t ShaderCompilerService::createProgram(
     token->handle = mCallbackManager.get();
 
     CompilerPriorityQueue const priorityQueue = program.getPriorityQueue();
-    if (mShaderCompilerThreadCount) {
+    if (mMode == Mode::THREAD_POOL) {
         // queue a compile job
         mCompilerThreadPool.queue(priorityQueue, token,
                 [this, &gl, program = std::move(program), token]() mutable {
                     // compile the shaders
                     std::array<GLuint, Program::SHADER_TYPE_COUNT> shaders{};
-                    std::array<utils::CString, Program::SHADER_TYPE_COUNT> shaderSourceCode;
                     compileShaders(gl,
                             std::move(program.getShadersSource()),
                             program.getSpecializationConstants(),
+                            program.isMultiview(),
                             shaders,
-                            shaderSourceCode);
+                            token->shaderSourceCode);
 
                     // link the program
                     GLuint const glProgram = linkProgram(gl, shaders, token->attributes);
@@ -253,8 +293,6 @@ ShaderCompilerService::program_token_t ShaderCompilerService::createProgram(
                     GLint status = GL_FALSE;
                     glGetProgramiv(glProgram, GL_LINK_STATUS, &status);
                     programData.program = glProgram;
-
-                    token->gl.program = programData.program;
 
                     // we don't need to check for success here, it'll be done on the
                     // main thread side.
@@ -275,11 +313,13 @@ ShaderCompilerService::program_token_t ShaderCompilerService::createProgram(
         compileShaders(gl,
                 std::move(program.getShadersSource()),
                 program.getSpecializationConstants(),
+                program.isMultiview(),
                 token->gl.shaders,
                 token->shaderSourceCode);
 
         runAtNextTick(priorityQueue, token, [this, token](Job const&) {
-            if (KHR_parallel_shader_compile) {
+            assert_invariant(mMode != Mode::THREAD_POOL);
+            if (mMode == Mode::ASYNCHRONOUS) {
                 // don't attempt to link this program if all shaders are not done compiling
                 GLint status;
                 if (token->gl.program) {
@@ -303,7 +343,7 @@ ShaderCompilerService::program_token_t ShaderCompilerService::createProgram(
                 // link the program, this also cannot fail because status is checked later.
                 token->gl.program = linkProgram(mDriver.getContext(),
                         token->gl.shaders, token->attributes);
-                if (KHR_parallel_shader_compile) {
+                if (mMode == Mode::ASYNCHRONOUS) {
                     // wait until the link finishes...
                     return false;
                 }
@@ -331,20 +371,20 @@ ShaderCompilerService::program_token_t ShaderCompilerService::createProgram(
 GLuint ShaderCompilerService::getProgram(ShaderCompilerService::program_token_t& token) {
     GLuint const program = initialize(token);
     assert_invariant(token == nullptr);
-#ifndef FILAMENT_ENABLE_MATDBG
+#if !FILAMENT_ENABLE_MATDBG
     assert_invariant(program);
 #endif
     return program;
 }
 
-/* static*/ void ShaderCompilerService::terminate(program_token_t& token) {
+void ShaderCompilerService::terminate(program_token_t& token) {
     assert_invariant(token);
 
     token->canceled = true;
 
-    bool canceled = token->compiler.cancelTickOp(token);
+    bool const canceled = token->compiler.cancelTickOp(token);
 
-    if (token->compiler.mShaderCompilerThreadCount) {
+    if (token->compiler.mMode == Mode::THREAD_POOL) {
         auto job = token->compiler.mCompilerThreadPool.dequeue(token);
         if (!job) {
             // The job is being executed right now. We need to wait for it to finish to avoid a
@@ -378,7 +418,7 @@ GLuint ShaderCompilerService::getProgram(ShaderCompilerService::program_token_t&
 
 void ShaderCompilerService::tick() {
     // we don't need to run executeTickOps() if we're using the thread-pool
-    if (UTILS_UNLIKELY(!mShaderCompilerThreadCount)) {
+    if (UTILS_UNLIKELY(mMode != Mode::THREAD_POOL)) {
         executeTickOps();
     }
 }
@@ -403,7 +443,7 @@ void ShaderCompilerService::getProgramFromCompilerPool(program_token_t& token) n
 GLuint ShaderCompilerService::initialize(program_token_t& token) noexcept {
     SYSTRACE_CALL();
     if (!token->gl.program) {
-        if (mShaderCompilerThreadCount) {
+        if (mMode == Mode::THREAD_POOL) {
             // we need this program right now, remove it from the queue
             auto job = mCompilerThreadPool.dequeue(token);
             if (job) {
@@ -419,7 +459,7 @@ GLuint ShaderCompilerService::initialize(program_token_t& token) noexcept {
             // Block until we get the program from the pool. Generally this wouldn't block
             // because we just compiled the program above, when executing job.
             ShaderCompilerService::getProgramFromCompilerPool(token);
-        } else if (KHR_parallel_shader_compile) {
+        } else if (mMode == Mode::ASYNCHRONOUS) {
             // we force the program link -- which might stall, either here or below in
             // checkProgramStatus(), but we don't have a choice, we need to use the program now.
             token->compiler.cancelTickOp(token);
@@ -448,6 +488,12 @@ GLuint ShaderCompilerService::initialize(program_token_t& token) noexcept {
     // check status of program linking and shader compilation, logs error and free all resources
     // in case of error.
     bool const success = checkProgramStatus(token);
+
+    // Unless we have matdbg, we panic if a program is invalid. Otherwise, we'd get a UB.
+    // The compilation error has been logged to log.e by this point.
+    FILAMENT_CHECK_POSTCONDITION(FILAMENT_ENABLE_MATDBG || success)
+            << "OpenGL program " << token->name.c_str_safe() << " failed to link or compile";
+
     if (UTILS_LIKELY(success)) {
         program = token->gl.program;
         // no need to keep the shaders around
@@ -476,6 +522,7 @@ GLuint ShaderCompilerService::initialize(program_token_t& token) noexcept {
 void ShaderCompilerService::compileShaders(OpenGLContext& context,
         Program::ShaderSource shadersSource,
         utils::FixedCapacityVector<Program::SpecializationConstant> const& specializationConstants,
+        bool multiview,
         std::array<GLuint, Program::SHADER_TYPE_COUNT>& outShaders,
         UTILS_UNUSED_IN_RELEASE std::array<CString, Program::SHADER_TYPE_COUNT>& outShaderSourceCode) noexcept {
 
@@ -489,8 +536,16 @@ void ShaderCompilerService::compileShaders(OpenGLContext& context,
     };
 
     std::string specializationConstantString;
+    int32_t numViews = 2;
     for (auto const& sc : specializationConstants) {
         appendSpecConstantString(specializationConstantString, sc);
+        if (sc.id == 8) {
+            // This constant must match
+            // ReservedSpecializationConstants::CONFIG_STEREO_EYE_COUNT
+            // which we can't use here because it's defined in EngineEnums.h.
+            // (we're breaking layering here, but it's for the good cause).
+            numViews = std::get<int32_t>(sc.value);
+        }
     }
     if (!specializationConstantString.empty()) {
         specializationConstantString += '\n';
@@ -519,39 +574,60 @@ void ShaderCompilerService::compileShaders(OpenGLContext& context,
 
         if (UTILS_LIKELY(!shadersSource[i].empty())) {
             Program::ShaderBlob& shader = shadersSource[i];
+            char* shader_src = reinterpret_cast<char*>(shader.data());
+            size_t shader_len = shader.size();
 
             // remove GOOGLE_cpp_style_line_directive
-            std::string_view const source = process_GOOGLE_cpp_style_line_directive(context,
-                    reinterpret_cast<char*>(shader.data()), shader.size());
+            process_GOOGLE_cpp_style_line_directive(context, shader_src, shader_len);
+
+            // replace the value of layout(num_views = X) for multiview extension
+            if (multiview && stage == ShaderStage::VERTEX) {
+                process_OVR_multiview2(context, numViews, shader_src, shader_len);
+            }
 
             // add support for ARB_shading_language_packing if needed
             auto const packingFunctions = process_ARB_shading_language_packing(context);
 
-            // split shader source, so we can insert the specification constants and the packing functions
-            auto const [prolog, body] = splitShaderSource(source);
+            // split shader source, so we can insert the specialization constants and the packing
+            // functions
+            auto [version, prolog, body] = splitShaderSource({ shader_src, shader_len });
 
-            const std::array<const char*, 4> sources = {
-                    prolog.data(),
-                    specializationConstantString.c_str(),
-                    packingFunctions.data(),
-                    body.data()
+            // enable ESSL 3.10 if available
+            if (context.isAtLeastGLES<3, 1>()) {
+                version = "#version 310 es\n";
+            }
+
+            std::array<std::string_view, 5> sources = {
+                version,
+                prolog,
+                specializationConstantString,
+                packingFunctions,
+                { body.data(), body.size() - 1 }  // null-terminated
             };
 
-            const std::array<GLint, 4> lengths = {
-                    (GLint)prolog.length(),
-                    (GLint)specializationConstantString.length(),
-                    (GLint)packingFunctions.length(),
-                    (GLint)body.length() - 1 // null terminated
-            };
+            // Some of the sources may be zero-length. Remove them as to avoid passing lengths of
+            // zero to glShaderSource(). glShaderSource should work with lengths of zero, but some
+            // drivers instead interpret zero as a sentinel for a null-terminated string.
+            auto partitionPoint = std::stable_partition(
+                    sources.begin(), sources.end(), [](std::string_view s) { return !s.empty(); });
+            size_t count = std::distance(sources.begin(), partitionPoint);
+
+            std::array<const char*, 5> shaderStrings;
+            std::array<GLint, 5> lengths;
+            for (size_t i = 0; i < count; i++) {
+                shaderStrings[i] = sources[i].data();
+                lengths[i] = sources[i].size();
+            }
 
             GLuint const shaderId = glCreateShader(glShaderType);
-            glShaderSource(shaderId, sources.size(), sources.data(), lengths.data());
+            glShaderSource(shaderId, count, shaderStrings.data(), lengths.data());
+
             glCompileShader(shaderId);
 
 #ifndef NDEBUG
             // for debugging we return the original shader source (without the modifications we
             // made here), otherwise the line numbers wouldn't match.
-            outShaderSourceCode[i] = { source.data(), source.length() };
+            outShaderSourceCode[i] = { shader_src, shader_len };
 #endif
 
             outShaders[i] = shaderId;
@@ -560,19 +636,64 @@ void ShaderCompilerService::compileShaders(OpenGLContext& context,
 }
 
 // If usages of the Google-style line directive are present, remove them, as some
-// drivers don't allow the quotation marks. This happens in-place.
-std::string_view ShaderCompilerService::process_GOOGLE_cpp_style_line_directive(OpenGLContext& context,
+// drivers don't allow the quotation marks. This source modification happens in-place.
+void ShaderCompilerService::process_GOOGLE_cpp_style_line_directive(OpenGLContext& context,
         char* source, size_t len) noexcept {
     if (!context.ext.GOOGLE_cpp_style_line_directive) {
         if (UTILS_UNLIKELY(requestsGoogleLineDirectivesExtension({ source, len }))) {
             removeGoogleLineDirectives(source, len); // length is unaffected
         }
     }
-    return { source, len };
+}
+
+// Look up the `source` to replace the number of eyes for multiview with the given number. This is
+// necessary for OpenGL because OpenGL relies on the number specified in shader files to determine
+// the number of views, which is assumed as a single digit, for multiview.
+// This source modification happens in-place.
+void ShaderCompilerService::process_OVR_multiview2(OpenGLContext& context,
+        int32_t eyeCount, char* source, size_t len) noexcept {
+    // We don't use regular expression in favor of performance.
+    if (context.ext.OVR_multiview2) {
+        const std::string_view shader{ source, len };
+        const std::string_view layout = "layout";
+        const std::string_view num_views = "num_views";
+        size_t found = 0;
+        while (true) {
+            found = shader.find(layout, found);
+            if (found == std::string_view::npos) {
+                break;
+            }
+            found = shader.find_first_not_of(' ', found + layout.size());
+            if (found == std::string_view::npos || shader[found] != '(') {
+                continue;
+            }
+            found = shader.find_first_not_of(' ', found + 1);
+            if (found == std::string_view::npos) {
+                continue;
+            }
+            if (shader.compare(found, num_views.size(), num_views) != 0) {
+                continue;
+            }
+            found = shader.find_first_not_of(' ', found + num_views.size());
+            if (found == std::string_view::npos || shader[found] != '=') {
+                continue;
+            }
+            found = shader.find_first_not_of(' ', found + 1);
+            if (found == std::string_view::npos) {
+                continue;
+            }
+            // We assume the value should be one-digit number.
+            assert_invariant(eyeCount < 10);
+            assert_invariant(!::isdigit(source[found + 1]));
+            source[found] = '0' + eyeCount;
+            break;
+        }
+    }
 }
 
 // Tragically, OpenGL 4.1 doesn't support unpackHalf2x16 (appeared in 4.2) and
 // macOS doesn't support GL_ARB_shading_language_packing
+// Also GLES3.0 didn't have the full set of packing/unpacking functions
 std::string_view ShaderCompilerService::process_ARB_shading_language_packing(OpenGLContext& context) noexcept {
     using namespace std::literals;
 #ifdef BACKEND_OPENGL_VERSION_GL
@@ -612,31 +733,102 @@ highp uint packHalf2x16(vec2 v) {
     highp uint y = fp32tou16(v.y);
     return (y << 16u) | x;
 }
+highp uint packUnorm4x8(mediump vec4 v) {
+    v = round(clamp(v, 0.0, 1.0) * 255.0);
+    highp uint a = uint(v.x);
+    highp uint b = uint(v.y) <<  8;
+    highp uint c = uint(v.z) << 16;
+    highp uint d = uint(v.w) << 24;
+    return (a|b|c|d);
+}
+highp uint packSnorm4x8(mediump vec4 v) {
+    v = round(clamp(v, -1.0, 1.0) * 127.0);
+    highp uint a = uint((int(v.x) & 0xff));
+    highp uint b = uint((int(v.y) & 0xff)) <<  8;
+    highp uint c = uint((int(v.z) & 0xff)) << 16;
+    highp uint d = uint((int(v.w) & 0xff)) << 24;
+    return (a|b|c|d);
+}
+mediump vec4 unpackUnorm4x8(highp uint v) {
+    return vec4(float((v & 0x000000ffu)      ),
+                float((v & 0x0000ff00u) >>  8),
+                float((v & 0x00ff0000u) >> 16),
+                float((v & 0xff000000u) >> 24)) / 255.0;
+}
+mediump vec4 unpackSnorm4x8(highp uint v) {
+    int a = int(((v       ) & 0xffu) << 24u) >> 24 ;
+    int b = int(((v >>  8u) & 0xffu) << 24u) >> 24 ;
+    int c = int(((v >> 16u) & 0xffu) << 24u) >> 24 ;
+    int d = int(((v >> 24u) & 0xffu) << 24u) >> 24 ;
+    return clamp(vec4(float(a), float(b), float(c), float(d)) / 127.0, -1.0, 1.0);
+}
 )"sv;
     }
 #endif // BACKEND_OPENGL_VERSION_GL
+
+#ifdef BACKEND_OPENGL_VERSION_GLES
+    if (!context.isES2() && !context.isAtLeastGLES<3, 1>()) {
+        return R"(
+
+highp uint packUnorm4x8(mediump vec4 v) {
+    v = round(clamp(v, 0.0, 1.0) * 255.0);
+    highp uint a = uint(v.x);
+    highp uint b = uint(v.y) <<  8;
+    highp uint c = uint(v.z) << 16;
+    highp uint d = uint(v.w) << 24;
+    return (a|b|c|d);
+}
+highp uint packSnorm4x8(mediump vec4 v) {
+    v = round(clamp(v, -1.0, 1.0) * 127.0);
+    highp uint a = uint((int(v.x) & 0xff));
+    highp uint b = uint((int(v.y) & 0xff)) <<  8;
+    highp uint c = uint((int(v.z) & 0xff)) << 16;
+    highp uint d = uint((int(v.w) & 0xff)) << 24;
+    return (a|b|c|d);
+}
+mediump vec4 unpackUnorm4x8(highp uint v) {
+    return vec4(float((v & 0x000000ffu)      ),
+                float((v & 0x0000ff00u) >>  8),
+                float((v & 0x00ff0000u) >> 16),
+                float((v & 0xff000000u) >> 24)) / 255.0;
+}
+mediump vec4 unpackSnorm4x8(highp uint v) {
+    int a = int(((v       ) & 0xffu) << 24u) >> 24 ;
+    int b = int(((v >>  8u) & 0xffu) << 24u) >> 24 ;
+    int c = int(((v >> 16u) & 0xffu) << 24u) >> 24 ;
+    int d = int(((v >> 24u) & 0xffu) << 24u) >> 24 ;
+    return clamp(vec4(float(a), float(b), float(c), float(d)) / 127.0, -1.0, 1.0);
+}
+)"sv;
+    }
+#endif // BACKEND_OPENGL_VERSION_GLES
     return ""sv;
 }
 
-// split shader source code in two, the first section goes from the start to the line after the
-// last #extension, and the 2nd part goes from there to the end.
-std::array<std::string_view, 2> ShaderCompilerService::splitShaderSource(std::string_view source) noexcept {
-    auto start = source.find("#version");
-    assert_invariant(start != std::string_view::npos);
+// split shader source code in three:
+// - the version line
+// - extensions
+// - everything else
+std::array<std::string_view, 3> ShaderCompilerService::splitShaderSource(std::string_view source) noexcept {
+    auto version_start = source.find("#version");
+    assert_invariant(version_start != std::string_view::npos);
 
-    auto pos = source.rfind("\n#extension");
-    if (pos == std::string_view::npos) {
-        pos = start;
+    auto version_eol = source.find('\n', version_start) + 1;
+    assert_invariant(version_eol != std::string_view::npos);
+
+    auto prolog_start = version_eol;
+    auto prolog_eol = source.rfind("\n#extension"); // last #extension line
+    if (prolog_eol == std::string_view::npos) {
+        prolog_eol = prolog_start;
     } else {
-        ++pos;
+        prolog_eol = source.find('\n', prolog_eol + 1) + 1;
     }
+    auto body_start = prolog_eol;
 
-    auto eol = source.find('\n', pos) + 1;
-    assert_invariant(eol != std::string_view::npos);
-
-    std::string_view const version = source.substr(start, eol - start);
-    std::string_view const body = source.substr(version.length(), source.length() - version.length());
-    return { version, body };
+    std::string_view const version = source.substr(version_start, version_eol - version_start);
+    std::string_view const prolog = source.substr(prolog_start, prolog_eol - prolog_start);
+    std::string_view const body = source.substr(body_start, source.length() - body_start);
+    return { version, prolog, body };
 }
 
 /*
