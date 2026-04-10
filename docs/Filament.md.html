@@ -2362,8 +2362,8 @@ When sampling the IBL, the clear coat layer is calculated as a second specular l
 float Fc = F_Schlick(0.04, 1.0, clearCoat_NoV) * clearCoat;
 // base layer attenuation for energy compensation
 iblDiffuse  *= 1.0 - Fc;
-iblSpecular *= sq(1.0 - Fc);
-iblSpecular += specularIBL(r, clearCoatPerceptualRoughness) * Fc;
+iblSpecular *= 1.0 - Fc;
+iblSpecular += evaluateSpecularIBL(r, clearCoatPerceptualRoughness) * Fc;
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 [Listing [clearCoatIBL]: GLSL implementation of the clear coat specular lobe for image-based lighting]
 
