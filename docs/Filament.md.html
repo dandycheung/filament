@@ -892,7 +892,7 @@ void BRDF(...) {
     float Frc = (Dc * Vc) * Fc;
 
     // account for energy loss in the base layer
-    return color * ((Fd + Fr) * (1.0 - Fc) + Frc);
+    return color * ((Fd + Fr * (1.0 - Fc)) * (1.0 - Fc) + Frc);
 }
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 [Listing [clearCoatBRDF]: Implementation of the clear coat BRDF in GLSL]
@@ -2362,8 +2362,8 @@ When sampling the IBL, the clear coat layer is calculated as a second specular l
 float Fc = F_Schlick(0.04, 1.0, clearCoat_NoV) * clearCoat;
 // base layer attenuation for energy compensation
 iblDiffuse  *= 1.0 - Fc;
-iblSpecular *= 1.0 - Fc;
-iblSpecular += evaluateSpecularIBL(r, clearCoatPerceptualRoughness) * Fc;
+iblSpecular *= sq(1.0 - Fc);
+iblSpecular += specularIBL(r, clearCoatPerceptualRoughness) * Fc;
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 [Listing [clearCoatIBL]: GLSL implementation of the clear coat specular lobe for image-based lighting]
 
